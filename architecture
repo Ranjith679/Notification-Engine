@@ -1,0 +1,489 @@
+# Phase 0.1 — Requirements & Notification Lifecycle
+
+## 1. What are we building?
+
+Our system receives a request to send a notification:
+
+```text
+Client
+   │
+   │ POST /api/notifications
+   ▼
+Notification Engine
+   │
+   │ publish event
+   ▼
+Kafka
+   │
+   │ consume event
+   ▼
+Notification Processor
+   │
+   ├── IN_APP → WebSocket → User
+   │
+   └── EMAIL  → SMTP → User's email
+```
+
+The important part is:
+
+> **The API should not directly send the notification. It publishes an event to Kafka and lets the consumer process it asynchronously.**
+
+That's the core architectural idea of this project.
+
+---
+
+# 2. Our notification example
+
+Imagine an airline application wants to tell a passenger:
+
+> "Your flight BA123 has been delayed by 30 minutes."
+
+The airline application calls:
+
+```http
+POST /api/notifications
+```
+
+with:
+
+```json
+{
+  "userId": "user-101",
+  "channel": "IN_APP",
+  "title": "Flight Delayed",
+  "message": "Your flight BA123 has been delayed by 30 minutes."
+}
+```
+
+Our system should then do:
+
+```text
+API Request
+    ↓
+Validate request
+    ↓
+Create notification
+    ↓
+Save notification
+    ↓
+Publish Kafka event
+    ↓
+Return response
+```
+
+Meanwhile, separately:
+
+```text
+Kafka
+  ↓
+Consumer
+  ↓
+Process notification
+  ↓
+IN_APP
+  ↓
+WebSocket
+  ↓
+User's browser
+```
+
+The API doesn't sit there waiting for the browser notification to be delivered.
+
+That's **asynchronous processing**.
+
+---
+
+# 3. Notification lifecycle
+
+We'll use a simple lifecycle.
+
+```text
+                ┌─────────────┐
+                │   CREATED   │
+                └──────┬──────┘
+                       │
+                 Kafka event
+                       │
+                       ▼
+                ┌─────────────┐
+                │ PROCESSING  │
+                └──────┬──────┘
+                       │
+                  successful
+                       │
+                       ▼
+                ┌─────────────┐
+                │    SENT     │
+                └─────────────┘
+
+                       │
+                    failure
+                       ▼
+                ┌─────────────┐
+                │   RETRYING  │
+                └──────┬──────┘
+                       │
+              retries exhausted
+                       │
+                       ▼
+                ┌─────────────┐
+                │   FAILED    │
+                └─────────────┘
+```
+
+We'll keep the status model intentionally small.
+
+### Statuses
+
+```text
+CREATED
+PROCESSING
+SENT
+RETRYING
+FAILED
+```
+
+We don't need 15 different statuses.
+
+---
+
+# 4. What information does a notification need?
+
+Our core entity will roughly contain:
+
+```text
+Notification
+│
+├── id
+├── userId
+├── channel
+├── title
+├── message
+├── status
+├── createdAt
+└── sentAt
+```
+
+### Why each one?
+
+**id**
+
+Unique identifier for the notification.
+
+```text
+notification-123
+```
+
+**userId**
+
+Who should receive it?
+
+```text
+user-101
+```
+
+**channel**
+
+Where should we send it?
+
+```text
+IN_APP
+EMAIL
+```
+
+**title**
+
+Notification title.
+
+```text
+Flight Delayed
+```
+
+**message**
+
+Actual notification content.
+
+```text
+Your flight BA123 has been delayed by 30 minutes.
+```
+
+**status**
+
+Tracks processing.
+
+```text
+CREATED
+PROCESSING
+SENT
+RETRYING
+FAILED
+```
+
+**createdAt**
+
+When we created the notification.
+
+**sentAt**
+
+When processing successfully completed.
+
+---
+
+# 5. Notification Event
+
+Here's an important distinction.
+
+We have a **database entity**:
+
+```text
+Notification
+```
+
+But Kafka carries an **event**:
+
+```text
+NotificationEvent
+```
+
+They aren't necessarily the same thing.
+
+Our Kafka event will contain the information the consumer needs:
+
+```json
+{
+  "notificationId": "notification-123",
+  "userId": "user-101",
+  "channel": "IN_APP",
+  "title": "Flight Delayed",
+  "message": "Your flight BA123 has been delayed.",
+  "createdAt": "2026-08-15T21:10:00"
+}
+```
+
+Think of it like:
+
+```text
+Database Entity
+      ↓
+"What is this notification?"
+
+Kafka Event
+      ↓
+"What happened that other services need to know?"
+```
+
+This distinction is important for event-driven architecture.
+
+---
+
+# 6. Kafka topic
+
+We'll initially have one main topic:
+
+```text
+notifications
+```
+
+Flow:
+
+```text
+Notification API
+      │
+      ▼
+notifications topic
+      │
+      ▼
+Notification Consumer
+```
+
+Later we'll introduce:
+
+```text
+notifications
+notifications.DLT
+```
+
+for failed messages.
+
+---
+
+# 7. Channels
+
+We'll support two real channels.
+
+### IN_APP
+
+```text
+Kafka
+  ↓
+Consumer
+  ↓
+WebSocket
+  ↓
+Browser
+```
+
+### EMAIL
+
+```text
+Kafka
+  ↓
+Consumer
+  ↓
+Email Channel
+  ↓
+Local SMTP
+  ↓
+Email testing inbox
+```
+
+And our architecture will allow:
+
+```text
+NotificationChannel
+       │
+       ├── InAppNotificationChannel
+       └── EmailNotificationChannel
+```
+
+This will give us a natural opportunity to learn the **Strategy Pattern** later.
+
+We won't build Push right now.
+
+---
+
+# 8. Failure scenario
+
+This is where the project becomes interesting.
+
+Suppose email sending fails:
+
+```text
+Kafka
+  ↓
+Consumer
+  ↓
+Email Service
+  X
+```
+
+We don't immediately mark it permanently failed.
+
+Instead:
+
+```text
+Attempt 1
+   ↓
+FAIL
+   ↓
+Retry
+   ↓
+Attempt 2
+   ↓
+FAIL
+   ↓
+Retry
+   ↓
+Attempt 3
+   ↓
+FAIL
+   ↓
+DLQ
+```
+
+We'll implement this properly later.
+
+---
+
+# 9. Final architecture for our project
+
+At this stage, our target is:
+
+```text
+                    ┌─────────────────┐
+                    │      Client     │
+                    └────────┬────────┘
+                             │
+                         REST API
+                             │
+                             ▼
+                  ┌─────────────────────┐
+                  │ Notification Engine │
+                  │    Spring Boot      │
+                  └──────────┬──────────┘
+                             │
+                       Save to H2
+                             │
+                             ▼
+                         ┌───────┐
+                         │ Kafka │
+                         └───┬───┘
+                             │
+                         Consumer
+                             │
+                             ▼
+                  ┌─────────────────────┐
+                  │ Notification Service│
+                  └──────────┬──────────┘
+                             │
+                 ┌───────────┴───────────┐
+                 │                       │
+              IN_APP                  EMAIL
+                 │                       │
+             WebSocket                SMTP
+                 │                       │
+                 ▼                       ▼
+              Browser             Email Inbox
+```
+
+And eventually:
+
+```text
+Processing Failure
+       ↓
+    Retry
+       ↓
+    Retry
+       ↓
+    Retry
+       ↓
+notifications.DLT
+```
+
+---
+
+# 10. What we're deliberately NOT building
+
+To keep this interview project focused:
+
+❌ User management
+❌ Authentication/JWT
+❌ Admin dashboard
+❌ React application
+❌ Push notifications
+❌ Notification templates engine
+❌ Scheduling notifications
+❌ Redis
+❌ Multiple microservices
+❌ Kubernetes
+❌ PostgreSQL
+❌ Paid AWS infrastructure
+
+Those can all be added later if there's a real reason.
+
+---
+
+## Phase 0.1 checkpoint
+
+We now know:
+
+* What a notification is
+* Notification lifecycle
+* REST → Kafka → Consumer flow
+* Difference between entity and event
+* Kafka topics
+* Channels
+* Failure/retry concept
+* DLQ concept
+* Project scope
+
