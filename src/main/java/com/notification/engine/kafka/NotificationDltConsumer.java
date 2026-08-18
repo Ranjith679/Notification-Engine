@@ -18,11 +18,11 @@ public class NotificationDltConsumer {
     )
     public void consume(NotificationEvent event) {
 
-        // This event has already failed all retry attempts.
         log.error(
-                "Notification permanently failed. " +
-                        "Moved to DLT: {}",
-                event
+                "Notification permanently failed | DLT | userId={} | channel={} | title={}",
+                event.getUserId(),
+                event.getChannel(),
+                event.getTitle()
         );
     }
 }

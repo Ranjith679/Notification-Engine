@@ -17,10 +17,9 @@ public class LocalPushNotificationProvider
 
         // Simulates sending a push notification.
         log.info(
-                "PUSH notification sent to user {}: {} - {}",
+                "Push notification sent | userId={} | title={}",
                 event.getUserId(),
-                event.getTitle(),
-                event.getMessage()
+                event.getTitle()
         );
     }
 }
