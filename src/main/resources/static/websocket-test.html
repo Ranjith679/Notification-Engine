@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Notification Test</title>
+</head>
+
+<body>
+
+<h2>Notification Test</h2>
+
+<div id="status">Connecting...</div>
+
+<div id="notifications"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7.1.1/bundles/stomp.umd.min.js"></script>
+
+<script>
+
+    const userId = "user-101";
+
+    const client = new StompJs.Client({
+        brokerURL: 'ws://localhost:8080/ws',
+
+        onConnect: () => {
+
+            document.getElementById("status").innerText =
+                "Connected";
+
+            // Subscribe to this user's notification destination.
+            client.subscribe(
+                `/topic/notifications/${userId}`,
+                (message) => {
+
+                    const event = JSON.parse(message.body);
+
+                    console.log("Notification received:", event);
+
+                    const notification =
+                        document.createElement("p");
+
+                    notification.innerText =
+                        `${event.title}: ${event.message}`;
+
+                    document
+                        .getElementById("notifications")
+                        .appendChild(notification);
+                }
+            );
+        },
+
+        onWebSocketError: (error) => {
+            console.error("WebSocket error:", error);
+        },
+
+        onStompError: (frame) => {
+            console.error("STOMP error:", frame);
+        }
+    });
+
+    client.activate();
+
+</script>
+
+</body>
+</html>
