@@ -1,0 +1,713 @@
+Notification engine take away :
+
+@Enumerated(EnumType = String) -- if this not set on Enum filed in entity. JPA will store the values as 0,1,2 etc... instead of the text constants in that Enum.
+
+Why enums ? - if we use Strings , easily it could be send accidental invalid values. like for CREATED --> Created / created / CRETE, etc..
+
+
+Spring Data JPA - it gives abstraction to works with JDBC. without it we have to handle connections, prepared statements,qeries, result set manually everytime for every db interaction.
+ 
+JpaRepository - an interface we implements to get basic implementation of db methods like save(),findById(),etc..
+
+but we have not create any implmentation class for our repository interface then where do we get the default or custom defined db abstact methods? Spring Data Jpa create an implementation during runtime .
+
+--------------------------------------------------------------------------------------------------------------------------
+
+ORM - object relation mapping . a way to map java objects to db tables. 
+JPA - Java Persistant API - it's juts a specification of ORM . means it knows how to map the java objects. 
+  ex : @Entity
+  Jpa knoes the specification . the class name = table name , id = primary key , fileds = columns , String = Varchar ..
+but it does not have the actual implementation .
+
+Hibernate - actual implementation of JPA which has java code to create the table using JDBC internally without managing the JDBC things.
+
+Spring data JPA - one more layer on top . gives us convenient repo abstraction over JPA. without it we have to  implement a class to a JPA interface and add methods with @Query for save , fidnByID, etc.. then we use it in service. 
+
+but with spring data jpa we just extend our repo interface with JpaRepository and directly access save()..
+
+JDBC - specification for database transaction. we manage connections, queries, resultset,etc..
+
+DB Drivers -JDBC is just a specification but only driver know how to talk to the given DB.
+
+
+---------------------------------------------------------------------------------------------------------------------------
+Kafka - messaging broker for building a event driven architecture 
+Event - a message we send and receive to kafka broker
+kafka broker - a running server manages kakfa environment
+producer - sender who sends event to kafka topic
+consumer - who reads the message from the topic
+topic - is like a mailbox . it's named stream of events
+partitions - divisions of topic. for parallel processing , scalability and ordering within a partition. kafka can guarantee order within a partition not across topic
+
+ex:
+notification-events
+
+Partition 0:
+  Event A
+  Event C
+  Event E
+
+Partition 1:
+  Event B
+  Event D
+  Event F
+offset - events in a partitions are tracked by offset. a consumer tracks where it has processed by offset.
+
+ex: consumer be like 
+Last processed = offset 2 
+
+if the consumer crashes . it can resume it from left position. this is vital when implementing retry ot DLQ
+
+
+consumer group - consumers sharing the same topic / different partitions in same topic. kafka can distribute partitions to separate consumer groups.
+
+why not @Async for async operations ?
+
+when executing async tasks, if the we lose the taks. but in kafka, if the consumer crashes still the kakfa holds the data and can be retriewed when consumer back
+
+-------------------------------------------------------------------------------------------------------------------------
+
+every kakfa event will have a key . in ours it's user id .  when our topc has multiple partitions if the key is same kakfa will route the similar events to same partition .
+
+note , most of the kakfa start failure will be due to the logs directory we create and formatted with UUID. beacuse the while restarting the kakfa broker if we made chnages to the kafka propertiesd in servers the existing events in the offset might be stored with old config thus could conflict. the topics we create are belongs to the current log dir that's why we clear it before restart if we made any chnages in the kafka config.
+
+for this project i have ceated a new dir and formmated with UUID and add it's path in server.properties in KRaft in kakfa folder. it started smoothly , and i created topics 
+
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Why key value serializer in kafka producer. kafka only delas with bytes it does not know java objects . so we turn our NotificationEvent object - JSON bytes using JsonSerializer . Again the consumer will get the Json bytes and uses JsonDeserialiser to turn it back to java object.
+
+there are 2 ways to create a topic in kafka.
+
+1. create it using command in termininal to a running kafka :
+
+.\bin\windows\kafka-topics.bat --create --topic test-topic --bootstrap-server localhost:9092 --partitions 1 --replication-factor 1
+
+topic name :  test-topic 
+partition : 1
+replication-factor : 1
+
+2. create using spring boot while starting the application . declare a bean in a config class which return NewTopic with topic name , partition and replication-factor.
+
+@Configuration
+public class KafkaTopicConfig {
+
+    @Bean
+    public NewTopic notificationTopic() {
+
+        // One partition is enough for our local learning project.
+        return new NewTopic("notification-events", 1, (short) 1);
+    }
+}
+
+
+KakfaTemplate<K,V> is a main as abstarction for produce an event.  the send() in KafkaTemplate produce the actual event to a kafka broker.
+
+K : key can be anything unique to the event
+V : the event object
+
+----------------------------------------------------------------------------------------------------------------------
+
+spring.kafka.consumer.auto-offset-reset=earliest 
+
+if the consumer group has no existing offset , then start from earliest available record. if not start read from the offset where consumer group comitted.
+
+dont repeat the consumer group id in both @KafkaListener() and in properties . keep it one place. if the whole application is a single consumer use it in properties else use it in listener annotation based on consumer group.
+
+scenario : 
+
+in notification-events topic partition 0 , we receive 3 events A B and C associated to offset 0 1 and 2. if a consumer from a group reads A and the consume methode runs and returns successfully . then the spring kafka commit the consumer progress according to the acknowledgement configuration.
+
+ex :
+
+consumer ack offset 0 (event A)
+
+committed 
+
+next time starts from offset 1 (event B)
+
+problem : in our project after consumed the event we sent the event to mail server and returns it. internally the event ack. but what if the email server down or failed to send the mail due to any error. we lose the chance to retry it.
+
+later we change the ack configuration and not ack the event until the email service sends response, if it did not we are going to retry/DLQ.
+
+kafka does not push the event to consumer rather the consumer polls the kafka for events. spring kakfa hides the polling loop from us,
+
+
+----------------------------------------------------------------------------------------------------------------------
+
+Duel write problem: 
+
+now we create notification in db and send event to kakfa. thats it but what if the produced event failed somewhere.the consumers would not know that such notification created in the db. even if we use @Transaction since kakfa is not participating in the db transaction we cannot rollback (after the publish by send() the transaction does not wait it executes remaing lines and finishes it).
+
+solution ? 
+
+3 industry ways : Transactional kafka + db coordination , Outbox patter and CDC/Debazium.
+
+but we are not using those instead while we publish we are wait for some time ans get back the response else we throw exception.
+
+try {
+           
+ // Wait for Kafka to confirm the record was sent.
+            kafkaTemplate.send(TOPIC, event.getUserId(),event).get(5, TimeUnit.SECONDS);
+
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Failed to publish notification event to Kafka", e
+            );
+        }
+
+
+note : still we have not solved the duel write . the db still gonna have the record. only making the failure visible by throwing exception and later we are going to hnalde the exception and return proper failure response.
+
+
+dupliacte delivery :
+
+after publisg fail we send error response to client he retries it now new notification created in db for same user. thats duplicate delivery 
+
+------------------------------------------------------------------------------------------------------------------------
+
+Strategy pattern :
+
+when consumer receives notification event it has to decide who should handle the event based on channel. we can't use old if/else pattern in consumer because consumer's responsibilty should be only consume the events.
+
+so we use strategy pattern here. 
+
+first we create an interface called NotificationchannelHander with send(event).. so every channel handler like SMS ,email, websocket or whatsapp should implemenet this and override the send() to handle the logics.
+
+ok, all handlers created. now can we use if else to use the right handler to handle the event ? no 
+
+still we should not have the handler login in consumer.
+
+create NotificationProcessor with process(event) and send the event to that method. 
+
+The processor service first find the correct handler based on hanlder in event and let that hanlde it.
+
+-------------------------------------------------------------------------------------------------------------------------
+WebSocket crash coarse :
+
+WebSocket Learning Track
+    3.2-L1  What is WebSocket?
+    3.2-L2  HTTP vs WebSocket
+    3.2-L3  How WebSocket actually works
+    3.2-L4  What is STOMP?
+    3.2-L5  STOMP destinations & prefixes
+    3.2-L6  How Spring Boot handles it
+    3.2-L7  CORS & SockJS — only what we need
+    3.2-L8  Our project's complete WebSocket flow
+
+1. polling - if a browser/server pings a server continuesly to check any update. it's in-efficent in real-time notification
+
+2. HTTP vs Websocket
+
+  http : req - server -response.  if something changed in db 1 sec later. the server does not automatically pushes it to browser.
+
+  websocket : broswe/server ------ server.  persistance connection . no need to make requests it pushes automatically.
+
+ex : what'sapp - we don't req for new messages the what'sapp server pushes when new messages arrive
+
+our project :
+
+Kafka
+  ↓
+Notification Consumer
+  ↓
+Notification Processor
+  ↓
+WebSocket
+  ↓
+Browser
+
+is Websocket a replacement for HTTP ? no . our application can have both and works each for different clients.
+
+ok , how does the websocket knows which data to send and whom ? that's where STOMP comes in . websocket gives a persistant connection STOMP gives a message structure/protocol on top of that connection
+
+how does websocket starts ? the starts with http request and the server upgrades it to websocket connection
+
+what makes the websocket two-way ?
+
+With HTTP, the normal pattern is:
+
+Client → Request → Server
+Client ← Response ← Server
+
+With WebSocket:
+
+Client ═══════════════════ Server
+        persistent
+        connection
+
+
+Client → message
+Server → message
+Client → message
+Server → message
+
+For our project, we'll primarily use:
+
+Server → Browser
+
+because we're pushing notifications.
+
+
+What is STOMP ?
+
+STOMP = Simple Text Oriented Messaging Protocol.
+
+For our project, think of STOMP as:
+
+Raw websocket gives us a connection. STOMP is a set of conventions that tells us how clients and servers exchange messages over the WebSocket.
+
+without STOMP, for every exchanging messages we have to write code to define a protocol or message structure to understand or process the message.
+
+stomp gives us existing message models like :
+
+CONNECT
+SUBSCRIBE {url} - clients want to listen to this destination for messages
+SEND
+MESSAGE {url} -the server sends messages to this client because he subscribed 
+DISCONNECT
+
+analogy: HTTP protocol we have GET,POST,PUT,DELETE. we don't just send messages and expect the server to understand the operation but define it as a structure. same concept.
+
+------------------------------------------------------------------------------------------------------------------------
+
+Config class for websocket break down:
+
+
+@EnableWebSocketMessageBroker - spring allows clients(browser/server) to connect via websocket and exchange messages using a STOMP protocol
+
+message broker - in-memory message sever in our application which routes the message between websocket client and our controller.
+
+                        [web socket con]           [service send event then broker publish to subscribers]
+   ex: client(browser) <-----------------> broker <--------------------------------------------------->controller/service 
+
+WebSocketMessageBrokerConfigurer - an interface we implement in config class to customize our message broker.
+
+configureMessageBroker(MessageBrokerRegistry registry) - method we override from WebSocketMessageBrokerConfigurer to set up our broker 
+
+registry.enableSimpleBroker("/topic"); - creates an in-memory message broker inside our application. This broker manages subscriptions and distributes messages to connected clients. Any message sent to destination starts with /topic are distributed to subscribers.
+
+ex: if a client subscribes to /topic/* , they will receive messages received here 
+
+registry.setApplicationDestinationPrefixes("/app"); - read the method name like: i'm setting the destination prefix to reach this application to /app. when client sends message to /app/* it will be handled by controllers
+
+registerStompEndpoints(StompEndpointRegistry registry) - method we override from WebSocketMessageBrokerConfigurer to set up a endpoints for our websocket . The url client's use to connect
+
+registry.addEndpoint("/ws").setAllowedOriginPatterns("*"); creates an WebSocket endpoint so clients will use it to establish a connection. and spring bydefault expects from same origin 8080 we set to handshake from any(*) origin
+
+Note : /ws is for client to make a connection and /app is for client to send message to broker 
+
+🧩 Putting It All Together
+
+Clients connect to /ws.
+
+Messages sent to /app/... go to your server-side controller methods.
+
+Messages sent to /topic/... are broadcast back out to all subscribed clients
+
+-------------------------------------------------------------------------------------------------------------------------
+
+Kafka consumer receives an event and ask NotificationProcessor to process it. then it choose the right notification handler object to process it
+
+Now WebSocketNotificationHandler - take the event and send it to correct user's websocket destination by user-id in the event
+
+Event:
+userId = user-101
+
+        ↓
+/topic/notifications/user-101
+
+        ↓
+Browser subscribed to that destination
+
+--------- {the whole this like KafkaTemplate , Topic name and send()}
+SimpMessagingTemplate - helper tool used to send STOMP messages to websocket clients
+
+String destination = "/topic/notifications/" + event.getUserId();  / url for sending messages to client
+
+messagingTemplate.convertAndSend(destination, event); // method to publish message to subscribers. any webscoket clients subscribed to /topic will receive the event .
+-----------
+
+--------------------------------------------------------------------------------------------------------------------------
+
+spring-boot-starter-mail : gives us JavaMailSender to connect with SMTP server (mail server) it could be local server or AWS service 
+
+---We are going to use test SMTP server Malpit for faking emails. download it or run it docker. it runs like kakfa/minio and gives URL we can send email to that url and view it in browser's UI to see the emails.
+
+makes sure to set config in property file just like DB/kafka
+
+eg: 
+
+spring.mail.host=localhost
+spring.mail.port=1025
+spring.mail.username=
+spring.mail.password=
+
+------------------
+
+JavaMailSender - used to connect with mail server and sent drafted mail using SimpleMailMessage
+drafted how ?
+
+SimpleMailMessage - object used to draft a mail. 
+
+ex:
+
+message.setTo(event.getRecipient());
+message.setSubject(event.getTitle());
+message.setText(event.getMessage());
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Push Channel
+
+so far our server send messages to client desktop when he opened the application. the notification will appear in the application itself. 
+
+PUSH - our server send message to user's device directly then their OS displays the message. 
+
+Ex: 
+Android notifications for all the apps 
+Windows notifications for all the apps
+Same for apple IOS 
+
+for that we have to use push providers like FCM (Firebase Cloud Messaging),APN(Apple's Push Notification) or AWS SNS. but those are paid so we are gonna use just create a service like push notification provider and it's gonna take the event where channel id push and just log the event.
+
+------------------------------------------------------------------------------------------------------------------------
+
+The flow so far :
+Our processor now has three strategies
+
+When Spring starts, it finds:
+
+WebSocketNotificationHandler
+EmailNotificationHandler
+PushNotificationHandler
+
+The processor creates its map:
+
+IN_APP → WebSocketNotificationHandler
+EMAIL  → EmailNotificationHandler
+PUSH   → PushNotificationHandler
+
+So when Kafka sends:
+
+{
+  "channel": "PUSH",
+  "userId": "user-101",
+  "title": "Order Ready",
+  "message": "Your order is ready."
+}
+
+the flow becomes:
+
+Kafka
+  ↓
+Consumer
+  ↓
+Processor
+  ↓
+PUSH
+  ↓
+PushNotificationHandler
+  ↓
+LocalPushNotificationProvider
+  ↓
+Log
+
+separation of concerns + strategy pattern: 
+
+how ? 
+Our processor doesn't know:
+
+how WebSocket works
+how SMTP works
+how push works
+
+It only knows: "Give me the handler for this channel."
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Retry & DLQ (Dead Letter Queue)
+
+When notification comes for EMAIL --> consumer fetched and send to email handler --> Error ---> notification lost just saved in DB
+
+why ? 
+mail server may down
+incorrect mail address
+network issue
+timeout
+rate limit 
+
+So we implement Retry logic . 
+
+attempt1 --> attempt2--> attempt3 : in any of these attempts it may succeed if it's temporary failure
+
+what if it's not succeed in these attempts, we need to park these event somewhere for later manual fix or investigation.  we can't retry forever to waste CPU usage and block useful works.
+
+That's Dead Letter Queue. It's a Topic where failed events will be preserved. 
+
+if our normal topic is notification-events  then the DLQ topic will be notification-events-dlt.
+
+note: the same failed event should go into the DLQ not new one.
+
+Retry vs Reprocessing 
+
+retry fix if temporary failure . whereas, reprocessing is manual fix and investigation
+
+Final flow:
+
+                   Producer
+                      │
+                      ▼
+          notification-events
+                      │
+                      ▼
+                 Consumer
+                      │
+              process event
+             /            \
+            /              \
+        Success          Failure
+           │                │
+           ▼                ▼
+         Complete       Retry (3x)
+                              │
+                        Still fails
+                              │
+                              ▼
+             notification-events-dlt
+
+--------------------------------------------------------------------------------------------------------------------------
+Spring kafka has built-in retry/dlt support 
+
+@RetryableTopic(
+            attempts = "4",
+            backoff = @Backoff(
+                    delay = 2000,
+                    multiplier = 2.0
+            )
+    )
+
+@RetryableTopic - on top of @KakfaListener enables retry mechanism for that particular listener. it also knows how to send the totally failed event to DLT 
+attempts - total 4 processing include the first one.
+@Backoff - retry delay increases by multiplier . if 2 sec wait the next wait time is 4 ,8 
+ why? if email server is down. it's pointless to try immediately
+
+For @RetryableTopic spring creates a attempt topics for us automatically 
+like: 
+notification-events
+        │
+        ▼
+notification-events-retry-0
+        │
+        ▼
+notification-events-retry-1
+        │
+        ▼
+notification-events-retry-2
+        │
+        ▼
+notification-events-dlt
+
+why ?
+
+instead of sleeping the thread to x seconds and blocking the main thread from processing other events(Incoming NotificationEvent). keeping it in retry topic and take process it when timer is up.
+
+what causes the retry , our notification processor should throw any exception to invoke retry
+
+hammering a broken service -- means keep retry a down server 
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Now the failed event eventually sent to DLT by @RetryableTopic. now we are going to consume it from that topic and process it 
+
+@DltHandler - on top of a method in consumer class receives the failed event from DLT topic process it. we are just logging it. in real system we log failure info with error code , trigger an alert and raise an incident to operations team and allow replay.
+
+Replay event - sending event manually again root caused fixed.
+
+flow now :
+
+                    Kafka
+                      │
+                      ▼
+             notification-events
+                      │
+                      ▼
+                  Consumer
+                      │
+                      ▼
+                Process Event
+                 /         \
+                /           \
+             SUCCESS        FAILURE
+               │              │
+               ▼              ▼
+             Done          Retry 1
+                              │
+                           Retry 2
+                              │
+                           Retry 3
+                              │
+                              ▼
+                         DLT Topic
+                              │
+                              ▼
+                         DLT Handler
+
+
+
+-------------------------------------------------------------------------------------------------------------------------
+
+Create separate Consumer class and listener to Dlt Topic . why not just @DltHandler in NotificationConsumer ? just not mix responsibility.
+
+
+"The Kafka listener uses Spring Kafka's retryable topic mechanism. If notification processing fails, the event is routed through retry topics with exponential backoff. If all attempts fail, the event is moved to a dead-letter topic. A separate DLT consumer handles those failed events for logging and later investigation or replay."
+
+
+------------------------------------------------------------------------------------------------------------------------
+Observability :
+
+No Grafana , Prometheus or AWS ELK yet, just Actuator.
+
+
+Actuator ? Operational information of our spring boot application are exposed through endpoints.
+
+like health, info , metrics , ect..
+
+health may UP or DOWN. based in dependencies and configurations if JVM, DB and other indicators like TOMCATE, etc ..alive . it's UP.
+
+info tells us meta data about application like name version descp..
+
+metrics are applications internal numerics like JVM, HTTP requests, Memory, CPU,Threads,etc..
+
+Steps :  add dependency, add config to expose endpoints and test it.
+
+NEVER use System.out.println for web servers use logger Slf4j.
+
+------------------------------------------------------------------------------------------------------------------------
+
+CUSTOM METRICS.
+
+we already have generic spring metrics such as http requests , JVM memory , CPU etc.. custom metrics are numbers we track over the time while our application running.
+
+ex: tracking notification events processed , failed , etc.. 
+
+we can use micormeter for this , since spring actuator already has it.
+
+MeterRegistry - central placse all metrics are stored/registered in actuator. that's where we will get all /metric endpoints
+
+Counter - it's a micrometer's counter used to calculate how many times something happened. it only goes up never decrement. A Counter will have name, description and register(where to register- MeterRegistry). that's how we add to /metrics 
+
+BUSSINESS METRICS and INFRASTRUCTURE METRICS
+
+infra metrics are : JVM memory , CPU , Threads,
+
+bussiness metrics are : notification processed , failed, etc
+
+--------------------------------------------------------------------------------------------------------------------------
+
+Now climax :  development - deployment ready
+
+spring boot application -->  jar file-->dokcer image --> runs as container
+
+steps:
+1. package the application using maven and build the jar file.
+2. add Dockerfile in the project's root folder
+3. define the docker code to run the jar file.
+
+Dockerfile :
+
+FROM eclipse-temurin:17-jre
+WORKDIR /app
+COPY target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+
+explanation: 
+
+      1. start the image with an enviroment java 17-JRE installed. not JDK why ? we already compiled and build jar so to run JRE is enough.
+      2.create app folder and get naviagte inside
+      3.copy the jar file from /target in our project to /app
+      4.expose this particular application on port 8080 inside conatiner. why ? a container may have other applications listens on some other ports.
+      5. when the conatiner starts run the command to start the application inside the running container.
+
+4. build the docker image from dockerfile by running this command on root project , it set the image name as what we give : docker build -t notification-engine:1.0 
+
+conatiner = mini-OS 
+
+Problem : (docker networking concept)
+
+we defined kakfa running in localhost:9092 in property file. 
+until we run it windows it finds kafka running in same windows host but once the spring boot app gets inside the conatiner the localhost refers to the conatiner itself. then it looks for kafka in that container and could not connect to it.
+
+so either use : host.docker.internal:9092 - which conceptually does this
+
+Docker container
+       │
+       │ host.docker.internal
+       ▼
+Your machine
+       │
+       ▼
+Kafka :9092
+
+but hardcoding this ? use env variables : ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092} - this means when running normally it runs spring boot --> localhost:9092 but running inside container we give env variable in command so spring boot --> host.docker.internal:9092.
+
+if any codes changed in project : repackage for new jar and create new image for that jar.
+
+Another problem :
+
+Advertised listeners ?
+
+when spring boot try connects to kafka in windows host using host.dokcer.internal:9092 . the kakfa would responds like my address is localhost:9092 then spring boot checks localhost 9092 inside container and could not find it :
+
+why kakfa does this? it has 2 concepts
+
+listeners -> where kafka actually listens 
+advertised listener --> where kakfa tells client to listen
+
+when spring boot reaches kafka by host.docker.internal:9092 the kafka gives something like ["Broker 1 is at localhost:9092"]  the container then tries localhost 9092 inside container 
+
+solution
+
+in server.properties in kafka folder /KRaft. change the "advertised.listeners=PLAINTEXT://localhost:9092" to "advertised.listeners=PLAINTEXT://host.docker.internal:9092"
+
+-------------------------------------------------------------------------------------------------------------------------
+
+docker commands :
+
+docker ps : running container
+docker ps -a : all containers
+
+docker rm <container nm> : delete container 
+docker images : all images
+docker rmi <image nm> : delete image
+
+--------------------------------------------------------------------------------------------------------------------------
+the problem with current docker image :
+
+this assumes the maven build the jar and that jar copied to /app and runs using command in a JRE environment
+
+fine locally  but what if it's CI/CD . everything is automated flow we only push the code. there we need that build also readymade.
+
+Multi-state build
+
+-- the docker file will have 2 stages build + runtime . 
+
+Stage 1 — Build
+Maven + JDK
+      ↓
+    JAR
+      ↓
+Stage 2 — Runtime
+Java JRE
+      ↓
+  Run JAR
+
+note : the final image does not have maven or JDK 
+
+first it will start the envorment with maven and jdk installed and do the build and when it comes the second FROM eclipse-temurin:17-jre it will start the environment with only JRE thus the final image will only has JRE.
+
+
+
+
